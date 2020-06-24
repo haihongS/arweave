@@ -526,7 +526,6 @@ handle_cast({delete_tx_data, TXID}, State) ->
 			ar:err([{event, failed_to_delete_tx_data}, {reason, Reason}]);
 		{ok, Value} ->
 			{Offset, Size} = binary_to_term(Value),
-			ar_kv:delete(TXIndex, TXID),
 			gen_server:cast(?MODULE, {delete_chunks, ChunksIndex, Offset, Size});
 		_ ->
 			ok
@@ -543,12 +542,12 @@ handle_cast({delete_chunks, ChunksIndex, Offset, Size}, State) ->
 			State;
 		{Size, {ok, _, Value}} ->
 			{DataPathHash, _, _, _, _, ChunkSize} = binary_to_term(Value),
+			ok = ar_kv:delete(ChunksIndex, Key),
 			case ar_storage:delete_chunk(DataPathHash) of
 				ok ->
-					ar_kv:delete(ChunksIndex, Key),
 					gen_server:cast(?MODULE, {delete_chunks, ChunksIndex, Offset - ChunkSize, Size - ChunkSize}),
 					State#sync_data_state{
-						sync_record = ar_intervals:cut(SyncRecord, Offset)
+						sync_record = ar_intervals:delete(SyncRecord, {Offset, Offset - ChunkSize})
 					};
 				{error, Reason} ->
 					ar:err([{event, failed_to_delete_chunks}, {reason, Reason}]),

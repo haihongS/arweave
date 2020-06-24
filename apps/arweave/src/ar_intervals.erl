@@ -4,6 +4,7 @@
 	new/0,
 	add/3,
 	cut/2,
+	delete/2,
 	is_inside/2,
 	sum/1,
 	outerjoin/2,
@@ -60,6 +61,35 @@ safe_from_etf(Binary) ->
 			{error, invalid}
 	end.
 
+delete(Intervals, EndStart) ->
+	delete(gb_sets:iterator(Intervals), EndStart, gb_sets:new()).
+
+delete(Iterator, {End, Start} = EndStart, NewIntervals) ->
+	case gb_sets:next(Iterator) of
+		none ->
+			NewIntervals;
+		{{NextEnd, NextStart} = Element, NextIterator} ->
+			case {
+				End > NextStart andalso End < NextEnd,
+				Start < NextEnd andalso Start > NextStart,
+				NextEnd =< End andalso Start =< NextEnd
+			} of
+				{false, true, true} ->
+					delete(NextIterator, EndStart, gb_sets:add_element({End - (End - Start), Start - (Start - NextStart)}, NewIntervals));
+				{true, false, false} ->
+					case End + Start < NextEnd  of
+						true ->
+							delete(NextIterator, EndStart, gb_sets:add_element({End - Start, Start - (Start - NextStart)}, NewIntervals));
+						false ->
+							delete(NextIterator, EndStart, NewIntervals)
+					end;
+				{false, false, false} ->
+					delete(NextIterator, EndStart, gb_sets:add_element(Element, NewIntervals));
+				{_, _, _} ->
+					delete(NextIterator, EndStart, NewIntervals)
+			end
+	end.
+
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
@@ -96,7 +126,7 @@ is_inside2(Iterator, Number) ->
 	end.
 
 inverse(Intervals) ->
-	inverse(gb_sets:iterator(Intervals), 0, gb_sets:new()).
+	inverse(gb_sets:iterator(Intervals), 0, new()).
 
 inverse(Iterator, L, G) ->
 	case gb_sets:next(Iterator) of
@@ -107,14 +137,14 @@ inverse(Iterator, L, G) ->
 			L2 = End1,
 			case gb_sets:next(I1) of
 				none ->
-					gb_sets:add_element({infinity, L2}, G2);	
+					gb_sets:add_element({infinity, L2}, G2);
 				{{End2, Start2}, I2} ->
 					inverse(I2, End2, gb_sets:add_element({Start2, End1}, G2))
 			end
 	end.
 
 intersection(I1, I2) ->
-	intersection(gb_sets:iterator(I1), gb_sets:iterator(I2), gb_sets:new()).
+	intersection(gb_sets:iterator(I1), gb_sets:iterator(I2), new()).
 
 intersection(I1, I2, G) ->
 	case {gb_sets:next(I1), gb_sets:next(I2)} of
@@ -185,7 +215,7 @@ serialize_item(End, Start, json) ->
 
 from_etf(Binary) ->
 	L = binary_to_term(Binary, [safe]),
-	from_etf(L, infinity, gb_sets:new()).
+	from_etf(L, infinity, new()).
 
 from_etf([], _, Intervals) ->
 	{ok, Intervals};
