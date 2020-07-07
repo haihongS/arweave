@@ -12,6 +12,7 @@
 
 %% Start options with default values.
 -record(config, {
+	pool_mine = false,
 	benchmark = false,
 	port = ?DEFAULT_HTTP_IFACE_PORT,
 	mine = false,

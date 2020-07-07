@@ -2,7 +2,7 @@
 
 -export([run/0]).
 
--include("src/ar.hrl").
+-include("ar.hrl").
 
 %%% Runs a never ending mining performance benchmark.
 

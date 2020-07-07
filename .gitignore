@@ -11,3 +11,4 @@ apps/arweave/c_src/*.o
 data_test_master
 data_test_slave
 erl_crash.dump
+.idea
