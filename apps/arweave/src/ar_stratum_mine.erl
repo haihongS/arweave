@@ -11,6 +11,8 @@
 
 -export([run/0, get_sock/1]).
 -export([mine/2, stop/1, validate/3, validate/4]).
+-export([tcp_mgr/2, tcp_dial/1]).
+-export([mining_mgr/0]).
 
 -include("ar.hrl").
 
@@ -26,6 +28,81 @@
   max_miners = ?NUM_MINING_PROCESSES, % max mining process to start
   miners = [] % miner worker processes
 }).
+
+main_mgr() ->
+  TcpMgrPid = spawn(?MODULE, tcp_mgr, [self()]),
+  MiningMgrPid = spawn(?MODULE, mining_mgr, []),
+
+  main_listener(TcpMgrPid, MiningMgrPid),
+  ok.
+
+main_listener(TcpMgrPid, MiningMgrPid) ->
+  receive
+    {tcp_mgr_newdata, Data} ->
+      main_listener(TcpMgrPid, MiningMgrPid),
+      ok;
+    {mining_mgr_solution, Sol} ->
+      main_listener(TcpMgrPid, MiningMgrPid),
+      ok
+  end.
+
+tcp_mgr(MainPid, Sock) ->
+  case Sock of
+    nil ->
+      spawn(?MODULE, tcp_dial, [self()])
+  end,
+
+  receive
+    {got_sock, Sock} ->
+      tcp_mgr(MainPid, Sock);
+    {error_sock, ErrorReason} ->
+      % todo: log error
+      tcp_mgr(MainPid, nil);
+    {reset_sock} ->
+      tcp_mgr(MainPid, nil);
+    {from_sock, Data} ->
+      MainPid ! {tcp_mgr_newdata, Data},
+      tcp_mgr(MainPid, Sock);
+    {to_sock, Data} ->
+      if
+        Sock == nil -> ok;
+        true -> gen_tcp:send(Sock, Data)
+      end,
+      tcp_mgr(MainPid, Sock)
+  end.
+
+tcp_dial(TcpMgrPid) ->
+  TcpHost = ar_meta_db:get(pool_tcp_host),
+  TcpPort = ar_meta_db:get(pool_tcp_port),
+
+  case gen_tcp:connect(TcpHost, list_to_integer(TcpPort), ?TCP_OPTIONS, 5000) of
+    {ok, Sock} ->
+      TcpMgrPid ! {got_sock, Sock},
+      tcp_sock_loop(Sock, TcpMgrPid);
+    {error, Reason} ->
+      io:format("Client connect error: ~p~n", [Reason]),
+      TcpMgrPid ! {error_sock, Reason},
+      {error, nil}
+  end.
+
+tcp_sock_loop(Sock, TcpMgrPid) ->
+  receive
+    {tcp, Sock, Data} ->
+      io:format("Client received: ~s~n", [Data]),
+      TcpMgrPid ! {from_sock, Data},
+      tcp_sock_loop(Sock, TcpMgrPid);
+    {tcp_closed, Sock} ->
+      io:format("Client socket closed~n"),
+      TcpMgrPid ! {reset_sock};
+    {tcp_error, Sock, Reason} ->
+      io:format("Client socket error: ~p~n", [Reason]),
+      TcpMgrPid ! {error_sock, Reason};
+    Other ->
+      io:format("Client unexpected: ~p", [Other])
+  end.
+
+mining_mgr() ->
+  ok.
 
 miner_test() ->
   io:format("qqqqqq~n"),
@@ -85,10 +162,6 @@ log_listener() ->
   end.
 
 run() ->
-  miner_test(),
-  ok.
-
-run(M) ->
   Sock = spawn(?MODULE, get_sock, [self()]),
   io:format("Sock~p~n", [Sock]),
   mainloop().
@@ -97,7 +170,9 @@ mainloop() ->
   receive
     {got_sock, Sock} ->
       io:format("haha~n"),
-      gen_tcp:send(Sock, "xxxxxxxx"),
+      Tmp = {[{<<"foo">>, <<"bar">>}]},
+      TData = jiffy:encode(Tmp),
+      gen_tcp:send(Sock, TData),
       %% start miner
       x(Sock)
   end.
@@ -105,7 +180,9 @@ mainloop() ->
 x(Sock) ->
   receive
     {pool_job, Job} ->
-      io:format("pool job~p~n", [Job]),
+      io:format("pool job: ~p~n", [Job]),
+      Resp = jiffy:decode(Job, [return_maps]),
+      io:format("resp: ~p | ~p~n", [Resp, maps:get(<<"foo">>, Resp)]),
       timer:sleep(1000),
       gen_tcp:send(Sock, Job),
       x(Sock);

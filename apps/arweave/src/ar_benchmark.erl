@@ -31,6 +31,7 @@ initial_diff() ->
 	switch_diff(Diff, TimeSpent).
 
 loop({TotalHashesTried, TotalTimeSpent}, Difficulty) ->
+	io:format("Diff: ~p~n", [Difficulty]),
 	{HashesTried, TimeSpent} = mine(Difficulty, 10),
 	NewDifficulty = switch_diff(Difficulty, TimeSpent),
 	NewTotalHashesTried = TotalHashesTried + HashesTried,
