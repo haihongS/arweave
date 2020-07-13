@@ -13,6 +13,8 @@
 %% Start options with default values.
 -record(config, {
 	pool_mine = false,
+	pool_tcp_host = "",
+	pool_tcp_port = 12345,
 	benchmark = false,
 	port = ?DEFAULT_HTTP_IFACE_PORT,
 	mine = false,

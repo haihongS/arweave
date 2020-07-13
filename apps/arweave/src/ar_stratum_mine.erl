@@ -9,15 +9,13 @@
 -module(ar_stratum_mine).
 -author("sherlock").
 
-%% API
--export([]).
+-export([run/0, get_sock/1]).
+-export([mine/2, stop/1, validate/3, validate/4]).
 
 -include("ar.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
--define(TCP_HOST, "matpoo.io").
--define(TCP_PORT, 12345).
 -define(TCP_OPTIONS, [binary, {packet, raw}, {active, true}]).
 
 -record(miner_state, {
@@ -29,50 +27,128 @@
   miners = [] % miner worker processes
 }).
 
-main() ->
-  SockPid = spawn(?MODULE, get_sock_id, [self()]),
-  mainloop(),
+miner_test() ->
+  io:format("qqqqqq~n"),
+
+  ar_randomx_state:init(
+    whereis(ar_randomx_state),
+    ar_randomx_state:swap_height(485406),
+    crypto:strong_rand_bytes(32),
+    erlang:system_info(schedulers_online)
+  ),
+
+  start_miner_server(
+    #miner_state{
+      data_segment = <<127,68,21,83,156,14,14,112,69,189,228,133,76,20,179,145,128,92,224,27,
+        16,234,80,129,30,86,247,60,211,65,107,141,165,206,219,180,222,200,41,33,
+        38,228,19,202,233,251,131,88>>,
+      modified_diff =   115792089224058742650682137424559985932804201871617767750832240943213492305920,
+      timestamp = 1594621188,
+      height = 485406
+    },
+    self()
+  ),
+
+%%  WorkerState = #{
+%%    data_segment => <<127,68,21,83,156,14,14,112,69,189,228,133,76,20,179,145,128,92,224,27,
+%%      16,234,80,129,30,86,247,60,211,65,107,141,165,206,219,180,222,200,41,33,
+%%      38,228,19,202,233,251,131,88>>,
+%%    diff =>   115792089224058742650682137424559985932804201871617767750832240943213492305920,
+%%    timestamp => 1594621188,
+%%    height =>485406
+%%  },
+%%
+%%  io:format("height: ~p~n", [ar_randomx_state:swap_height(482780)]),
+%%  ar_randomx_state:init(
+%%    whereis(ar_randomx_state),
+%%    ar_randomx_state:swap_height(485406),
+%%    crypto:strong_rand_bytes(32),
+%%    erlang:system_info(schedulers_online)
+%%  ),
+
+%%  mine(WorkerState, self()),
+
+  log_listener(),
   ok.
+
+log_listener() ->
+  receive
+    {log, Msg} ->
+      io:format("log: ~p~n", [Msg]),
+      log_listener();
+    {solution, Hash, Nonce, Timestamp} ->
+      io:format("solution: ~p ~p ~p~n", [Hash, Nonce, Timestamp]),
+      log_listener();
+    {hashes_tried, T} ->
+      io:format("hashes tried ~p~n", [T]),
+      log_listener()
+  end.
+
+run() ->
+  miner_test(),
+  ok.
+
+run(M) ->
+  Sock = spawn(?MODULE, get_sock, [self()]),
+  io:format("Sock~p~n", [Sock]),
+  mainloop().
 
 mainloop() ->
   receive
-    {got_sock, SockPid} ->
-      io:format("haha"),
-      ok
-  end,
-  ok.
+    {got_sock, Sock} ->
+      io:format("haha~n"),
+      gen_tcp:send(Sock, "xxxxxxxx"),
+      %% start miner
+      x(Sock)
+  end.
 
-get_sock_id(Supervisor) ->
-  case gen_tcp:connect(?TCP_HOST, ?TCP_PORT, ?TCP_OPTIONS, 5000) of
+x(Sock) ->
+  receive
+    {pool_job, Job} ->
+      io:format("pool job~p~n", [Job]),
+      timer:sleep(1000),
+      gen_tcp:send(Sock, Job),
+      x(Sock);
+    {miner_sol, Sol} ->
+      x(Sock)
+  end.
+
+get_sock(Parent) ->
+  TcpHost = ar_meta_db:get(pool_tcp_host),
+  TcpPort = ar_meta_db:get(pool_tcp_port),
+  io:format("h: ~p~p~n", [TcpHost, TcpPort]),
+  case gen_tcp:connect(TcpHost, list_to_integer(TcpPort), ?TCP_OPTIONS, 5000) of
     {ok, Sock} ->
-      sock_loop(Sock, Supervisor),
-      {ok, Sock};
+      Parent ! {got_sock, Sock},
+      sock_loop(Sock, Parent);
     {error, Reason} ->
       io:format("Client connect error: ~p~n", [Reason]),
       {error, nil}
   end.
 
-sock_loop(Sock, Supervisor) ->
+sock_loop(Sock, Parent) ->
   receive
     {tcp, Sock, Data} ->
       io:format("Client received: ~s~n", [Data]),
-      Supervisor ! {yummy, "yyy"},
-      sock_loop(Sock, Supervisor);
+      Parent ! {pool_job, Data},
+      sock_loop(Sock, Parent);
     {tcp_closed, Sock} ->
       io:format("Client socket closed~n");
     {tcp_error, Sock, Reason} ->
       io:format("Client socket error: ~p~n", [Reason]);
     {sol, Data} ->
       % todo: handle send
+      io:format("coool~n"),
       gen_tcp:send(Sock, Data),
-      sock_loop(Sock, Supervisor);
+      sock_loop(Sock, Parent);
     Other ->
       io:format("Client unexpected: ~p", [Other])
   end.
 
-start_server(S) ->
+start_miner_server(S, LogPID) ->
+  io:format("sss: ~p~n", [S]),
   spawn(fun() ->
-    server(start_miners(S))
+    server(start_miners(S, LogPID))
   end).
 
 server(
@@ -86,17 +162,19 @@ server(
       ok;
     {solution, Hash, Nonce, Timestamp} ->
       % todo, convey to parent process
+      io:format("Soluuuuuution"),
       ok
   end.
 
 %% @doc Start the workers and return the new state.
 start_miners(
-  S = #miner_state{
-    data_segment = BDS,
-    modified_diff = MDF,
-    timestamp = TS,
-    height = H
-  }
+    S = #miner_state{
+      data_segment = BDS,
+      modified_diff = MDF,
+      timestamp = TS,
+      height = H
+    },
+    LogPID
 ) ->
   WorkerState = #{
     data_segment => BDS,
@@ -104,7 +182,8 @@ start_miners(
     timestamp => TS,
     height => H
   },
-  Miners = [spawn(?MODULE, mine, [WorkerState, self()]) || _ <- lists:seq(1, S#miner_state.max_miners)],
+  LogPID ! {log, WorkerState},
+  Miners = [spawn(?MODULE, mine, [WorkerState, LogPID]) || _ <- lists:seq(1, S#miner_state.max_miners)],
   S#miner_state {miners = Miners}.
 
 %% @doc Stop all workers.
@@ -132,7 +211,9 @@ mine(
   Supervisor
 ) ->
   process_flag(priority, low),
+  Supervisor ! {log, "XIXI~n"},
   {Nonce, Hash} = find_nonce(BDS, Diff, Height, Supervisor),
+  Supervisor ! {log, "HAHA~n"},
   Supervisor ! {solution, Hash, Nonce, Timestamp}.
 
 find_nonce(BDS, Diff, Height, Supervisor) ->
@@ -151,6 +232,7 @@ find_nonce(BDS, Diff, Height, Supervisor) ->
 randomx_hasher(Height) ->
   case ar_randomx_state:randomx_state_by_height(Height) of
     {state, {fast, FastState}} ->
+      io:format("faststate: ~p~n", [FastState]),
       Hasher = fun(Nonce, BDS, Diff) ->
         ar_mine_randomx:bulk_hash_fast(FastState, Nonce, BDS, Diff)
                end,
@@ -162,7 +244,9 @@ randomx_hasher(Height) ->
   end.
 
 find_nonce(BDS, Diff, Height, Nonce, Hasher, Supervisor) ->
+  io:format("p1~n"),
   {BDSHash, HashNonce, ExtraNonce, HashesTried} = Hasher(Nonce, BDS, Diff),
+  io:format("p2~n"),
   Supervisor ! {hashes_tried, HashesTried},
   case validate(BDSHash, Diff, Height) of
     false ->
