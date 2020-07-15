@@ -12,7 +12,7 @@
 -export([run/0, get_sock/1]).
 -export([mine/2, stop/1, validate/3, validate/4]).
 -export([tcp_mgr/2, tcp_dial/1]).
--export([mining_mgr/0]).
+-export([mining_mgr/2]).
 
 -include("ar.hrl").
 
@@ -21,17 +21,19 @@
 -define(TCP_OPTIONS, [binary, {packet, raw}, {active, true}]).
 
 -record(miner_state, {
+  job_id,
   data_segment,
   modified_diff,
   height,
   timestamp,
   max_miners = ?NUM_MINING_PROCESSES, % max mining process to start
-  miners = [] % miner worker processes
+  miners = [], % miner worker processes
+  randomx_state_init = false
 }).
 
 main_mgr() ->
-  TcpMgrPid = spawn(?MODULE, tcp_mgr, [self()]),
-  MiningMgrPid = spawn(?MODULE, mining_mgr, []),
+  TcpMgrPid = spawn(?MODULE, tcp_mgr, [self(), nil]),
+  MiningMgrPid = spawn(?MODULE, mining_mgr, [nil, self()]),
 
   main_listener(TcpMgrPid, MiningMgrPid),
   ok.
@@ -39,24 +41,133 @@ main_mgr() ->
 main_listener(TcpMgrPid, MiningMgrPid) ->
   receive
     {tcp_mgr_newdata, Data} ->
-      main_listener(TcpMgrPid, MiningMgrPid),
-      ok;
-    {mining_mgr_solution, Sol} ->
-      main_listener(TcpMgrPid, MiningMgrPid),
-      ok
+      State = job_json_to_state(Data),
+      io:format("State: ~p~n", [State]),
+      MiningMgrPid ! {new_job, State},
+      main_listener(TcpMgrPid, MiningMgrPid);
+
+    {mining_mgr_solution, JobId, Hash, Nonce, Timestamp} ->
+      io:format("Solution: ~p | ~p~n", [JobId, Hash]),
+      SubmitJson = solution_to_submit_json(JobId, Hash, Nonce),
+      io:format("SubmitJson: ~p~n", [SubmitJson]),
+      TcpMgrPid ! {to_sock, SubmitJson},
+      main_listener(TcpMgrPid, MiningMgrPid)
   end.
+
+solution_to_submit_json(JobId, Hash, Nonce) ->
+  Json =
+    {[
+        {id, 2},
+        {jsonrpc, <<"2.0">>},
+        {method, <<"submit">>},
+        {params, {[
+          {job_id, JobId},
+          {hash, list_to_binary(av_utils:binary_to_hex(Hash))},
+          {nonce, list_to_binary(av_utils:binary_to_hex(Nonce))}
+        ]}}
+    ]},
+  ar_serialize:jsonify(Json).
+
+job_json_to_state(JobJson) ->
+  Job = jiffy:decode(JobJson, [return_maps]),
+  Params = maps:get(<<"params">>, Job),
+
+  JobId = maps:get(<<"job_id">>, Params),
+  BDS = av_utils:hex_to_binary(binary_to_list(maps:get(<<"bds">>, Params))),
+  Diff = list_to_integer(binary_to_list(maps:get(<<"diff">>, Params)), 10),
+  Timestamp = maps:get(<<"timestamp">>, Params),
+  Height = maps:get(<<"height">>, Params),
+
+  Ans = #miner_state{
+    job_id = JobId,
+    data_segment = BDS,
+    modified_diff = Diff,
+    timestamp = Timestamp,
+    height = Height
+  },
+  Ans.
+
+mining_mgr(State, MainPid) ->
+  receive
+    {start_miners} ->
+      io:format("ss~n"),
+      UpdatedState = restart_miners_with_state(State, self()),
+      mining_mgr(UpdatedState, MainPid);
+
+    {new_job, NewState} ->
+      io:format("hh~n"),
+      RandomXState =
+        case State of
+          nil -> false;
+          _Else -> true
+        end,
+
+      UpdatedState = restart_miners_with_state(
+        NewState#miner_state{randomx_state_init = RandomXState},
+        self()
+      ),
+
+      io:format("UpdatedState: ~p~n", [UpdatedState]),
+      mining_mgr(UpdatedState, MainPid);
+    {new_randomx_state, Height} ->
+      % todo: update new randomx state
+      mining_mgr(State, MainPid);
+    {solution, JobId, Hash, Nonce, Timestamp} ->
+      MainPid ! {mining_mgr_solution, JobId, Hash, Nonce, Timestamp},
+      mining_mgr(State, MainPid)
+  end.
+
+restart_miners_with_state(S, MiningMgrPid) ->
+  stop_miners(S#miner_state.miners),
+  NewS = mining_start_miners(S, MiningMgrPid),
+  NewS.
+
+mining_start_miners(
+    S = #miner_state{
+      job_id = JobId,
+      data_segment = BDS,
+      modified_diff = MDF,
+      timestamp = TS,
+      height = H
+    },
+    MiningMgrPid
+) ->
+  case S#miner_state.randomx_state_init of
+    false -> mining_init_randomx_state(H);
+    true -> {}
+  end,
+
+  WorkerState = #{
+    job_id => JobId,
+    data_segment => BDS,
+    diff => MDF,
+    timestamp => TS,
+    height => H
+  },
+  Miners = [spawn(?MODULE, mine, [WorkerState, MiningMgrPid]) || _ <- lists:seq(1, S#miner_state.max_miners)],
+  S#miner_state {miners = Miners, randomx_state_init = true}.
+
+mining_init_randomx_state(Height) ->
+  ar_randomx_state:init(
+    whereis(ar_randomx_state),
+    ar_randomx_state:swap_height(Height),
+    crypto:strong_rand_bytes(32), % todo: add key bytes here
+    erlang:system_info(schedulers_online)
+  ).
 
 tcp_mgr(MainPid, Sock) ->
   case Sock of
     nil ->
-      spawn(?MODULE, tcp_dial, [self()])
+      spawn(?MODULE, tcp_dial, [self()]);
+    _Else -> {}
   end,
 
   receive
-    {got_sock, Sock} ->
-      tcp_mgr(MainPid, Sock);
+    {got_sock, NewSock} ->
+      tcp_mgr(MainPid, NewSock);
     {error_sock, ErrorReason} ->
       % todo: log error
+      timer:sleep(3000),
       tcp_mgr(MainPid, nil);
     {reset_sock} ->
       tcp_mgr(MainPid, nil);
@@ -98,11 +209,9 @@ tcp_sock_loop(Sock, TcpMgrPid) ->
       io:format("Client socket error: ~p~n", [Reason]),
       TcpMgrPid ! {error_sock, Reason};
     Other ->
-      io:format("Client unexpected: ~p", [Other])
+      io:format("Client unexpected: ~p", [Other]),
+      TcpMgrPid ! {reset_sock}
   end.
-
-mining_mgr() ->
-  ok.
 
 miner_test() ->
   io:format("qqqqqq~n"),
@@ -162,17 +271,18 @@ log_listener() ->
   end.
 
 run() ->
-  Sock = spawn(?MODULE, get_sock, [self()]),
-  io:format("Sock~p~n", [Sock]),
-  mainloop().
+  main_mgr().
+%%  Sock = spawn(?MODULE, get_sock, [self()]),
+%%  io:format("Sock~p~n", [Sock]),
+%%  mainloop().
 
 mainloop() ->
   receive
     {got_sock, Sock} ->
       io:format("haha~n"),
-      Tmp = {[{<<"foo">>, <<"bar">>}]},
+      Tmp = {[{<<"method">>, <<"bar">>}, {<<"params">>, {[{<<"bds">>, <<"7F4415539C0E0E7045BDE4854C14B391805CE01B10EA50811E56F73CD3416B8DA5CEDBB4DEC8292126E413CAE9FB8358">>}]}}]},
       TData = jiffy:encode(Tmp),
-      gen_tcp:send(Sock, TData),
+%%      gen_tcp:send(Sock, TData),
       %% start miner
       x(Sock)
   end.
@@ -182,7 +292,23 @@ x(Sock) ->
     {pool_job, Job} ->
       io:format("pool job: ~p~n", [Job]),
       Resp = jiffy:decode(Job, [return_maps]),
-      io:format("resp: ~p | ~p~n", [Resp, maps:get(<<"foo">>, Resp)]),
+
+      Params = maps:get(<<"params">>, Resp),
+      io:format("Params: ~p~n", [Params]),
+
+      Bds = av_utils:hex_to_binary(binary_to_list(maps:get(<<"bds">>, Params))),
+      io:format("Bds: ~p~n", [Bds]),
+
+      Diff = list_to_integer(binary_to_list(maps:get(<<"diff">>, Params)), 10),
+      io:format("diff: ~p~n", [Diff]),
+
+      Timestamp = maps:get(<<"timestamp">>, Params),
+      io:format("ts: ~p~n", [Timestamp]),
+
+      Height = maps:get(<<"height">>, Params),
+      io:format("height: ~p~n", [Height]),
+
+      io:format("resp: | ~p~n", [Resp]),
       timer:sleep(1000),
       gen_tcp:send(Sock, Job),
       x(Sock);
@@ -279,7 +405,8 @@ stop(PID) ->
 %% @doc A worker process to hash the data segment searching for a solution
 %% for the given diff.
 mine(
-  #{
+  S = #{
+    job_id := JobId,
     data_segment := BDS,
     diff := Diff,
     timestamp := Timestamp,
@@ -288,10 +415,10 @@ mine(
   Supervisor
 ) ->
   process_flag(priority, low),
-  Supervisor ! {log, "XIXI~n"},
+  io:format("XIXI~n"),
   {Nonce, Hash} = find_nonce(BDS, Diff, Height, Supervisor),
-  Supervisor ! {log, "HAHA~n"},
-  Supervisor ! {solution, Hash, Nonce, Timestamp}.
+  Supervisor ! {solution, JobId, Hash, Nonce, Timestamp},
+  mine(S, Supervisor).
 
 find_nonce(BDS, Diff, Height, Supervisor) ->
   case randomx_hasher(Height) of
@@ -309,7 +436,6 @@ find_nonce(BDS, Diff, Height, Supervisor) ->
 randomx_hasher(Height) ->
   case ar_randomx_state:randomx_state_by_height(Height) of
     {state, {fast, FastState}} ->
-      io:format("faststate: ~p~n", [FastState]),
       Hasher = fun(Nonce, BDS, Diff) ->
         ar_mine_randomx:bulk_hash_fast(FastState, Nonce, BDS, Diff)
                end,
@@ -321,9 +447,7 @@ randomx_hasher(Height) ->
   end.
 
 find_nonce(BDS, Diff, Height, Nonce, Hasher, Supervisor) ->
-  io:format("p1~n"),
   {BDSHash, HashNonce, ExtraNonce, HashesTried} = Hasher(Nonce, BDS, Diff),
-  io:format("p2~n"),
   Supervisor ! {hashes_tried, HashesTried},
   case validate(BDSHash, Diff, Height) of
     false ->
