@@ -13,6 +13,7 @@
 
 %% State record for miners
 -record(state, {
+	worker_state,
 	parent, % miners parent process (initiator)
 	current_block, % current block held by node
 	candidate_block = not_set, % the product of mining
@@ -390,9 +391,11 @@ reschedule_timestamp_refresh(S = #state{
 
 %% @doc Start the main mining server.
 start_server(S) ->
-	spawn(fun() ->
+	PID = spawn(fun() ->
 		server(start_miners(update_txs(S)))
-	end).
+	end),
+	register(mining_server, PID),
+  PID.
 
 %% @doc The main mining server.
 server(
@@ -409,6 +412,9 @@ server(
 	}
 ) ->
 	receive
+		{mining_job, Pid} ->
+			Pid ! {mining_job, S#state.worker_state},
+			server(S);
 		%% Stop the mining process and all the workers.
 		stop ->
 			stop_miners(Miners),
@@ -516,7 +522,7 @@ start_miners(
 		height => Height
 	},
 	Miners = [spawn(?MODULE, mine, [WorkerState, self()]) || _ <- lists:seq(1, MaxMiners)],
-	S#state {miners = Miners}.
+	S#state {miners = Miners, worker_state = WorkerState}.
 
 %% @doc Stop all workers.
 stop_miners(Miners) ->

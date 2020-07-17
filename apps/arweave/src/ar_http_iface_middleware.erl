@@ -115,6 +115,32 @@ handle(<<"GET">>, [], Req, _Pid) ->
 handle(<<"GET">>, [<<"info">>], Req, _Pid) ->
 	return_info(Req);
 
+handle(<<"GET">>, [<<"job">>], Req, _Pid) ->
+	return_mining_job(Req);
+handle(<<"POST">>, [<<"solution">>], Req, Pid) ->
+	case read_complete_body(Req, Pid) of
+		{ok, SolutionJSON, Req2} ->
+%%      io:format("QueryJSON: ~p~n Req2: ~p~n", [SolutionJSON, Req2]),
+
+			MiningServerPid = whereis(mining_server),
+			case MiningServerPid of
+        undefined ->
+					{400, #{}, <<"nil mining">>, Req2};
+				_ ->
+					Solution = jiffy:decode(SolutionJSON, [return_maps, return_trailer]),
+					Hash = av_utils:hex_to_binary(binary_to_list(maps:get(<<"hash">>, Solution))),
+					Nonce = av_utils:hex_to_binary(binary_to_list(maps:get(<<"nonce">>, Solution))),
+					Timestamp = maps:get(<<"timestamp">>, Solution),
+					io:format("Submit Solution: Hash: ~p~n Nonce: ~p~n Timestamp: ~p~n", [Hash, Nonce, Timestamp]),
+
+					MiningServerPid ! {solution, Hash, Nonce, Timestamp},
+
+					{200, #{}, <<"xx~n">>, Req}
+      end;
+		{error, body_size_too_large} ->
+			{413, #{}, <<"Payload too large">>, Req}
+	end;
+
 %% @doc Some load balancers use 'HEAD's rather than 'GET's to tell if a node
 %% is alive. Appease them.
 handle(<<"HEAD">>, [], Req, _Pid) ->
@@ -1191,6 +1217,37 @@ return_info(Req) ->
 			}
 		),
 	Req}.
+
+return_mining_job(Req) ->
+  MiningServerPid = whereis(mining_server),
+	case MiningServerPid of
+    undefined ->
+			{
+				400, #{}, <<"nil mining">>, Req
+			};
+    _ ->
+			MiningServerPid ! {mining_job, self()},
+
+			receive
+				{mining_job, WS} ->
+					WS,
+					{
+						200,
+						#{},
+						ar_serialize:jsonify({[
+							{bds, list_to_binary(av_utils:binary_to_hex(maps:get(data_segment, WS)))},
+							{diff, list_to_binary(integer_to_list(maps:get(diff, WS)))},
+							{timestamp, maps:get(timestamp, WS)},
+							{height, maps:get(height, WS)}
+						]}),
+						Req
+					}
+			after 2000 ->
+				{
+					401, #{}, <<"nil job">>, Req
+				}
+			end
+	end.
 
 %% @doc converts a tuple of atoms to a {Module, Function} tuple.
 type_to_mf({tx, lookup_filename}) ->
